@@ -1,0 +1,140 @@
+name: Sync upstream and publish Docker images
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-and-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync_upstream:
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      synced_sha: ${{ steps.sync.outputs.synced_sha }}
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync from openclaw/openclaw
+        id: sync
+        env:
+          UPSTREAM_REPO: https://github.com/openclaw/openclaw.git
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -eux
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream || true
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream --prune
+
+          DEFAULT_BRANCH=$(git remote show upstream | sed -n '/HEAD branch/s/.*: //p')
+          TARGET_BRANCH="$BRANCH_NAME"
+
+          if [ -z "$TARGET_BRANCH" ] || ! git ls-remote --heads upstream "$TARGET_BRANCH" | grep -q .; then
+            TARGET_BRANCH="$DEFAULT_BRANCH"
+          fi
+
+          WORKFLOW_BACKUP=$(mktemp)
+          cp .github/workflows/sync-and-publish.yml "$WORKFLOW_BACKUP"
+
+          git reset --hard "upstream/$TARGET_BRANCH"
+          mkdir -p .github/workflows
+          cp "$WORKFLOW_BACKUP" .github/workflows/sync-and-publish.yml
+
+          # Avoid permission errors when pushing workflow updates with GitHub App token.
+          find .github/workflows -type f ! -name 'sync-and-publish.yml' -delete || true
+
+          # Avoid syncing local cache artifacts.
+          rm -rf .serena/cache || true
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No local delta after upstream sync"
+          else
+            git commit -m "chore: sync from upstream openclaw/openclaw"
+            git push origin HEAD:${GITHUB_REF_NAME} --force-with-lease
+          fi
+
+          echo "synced_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  publish_images:
+    needs: sync_upstream
+    if: always() && needs.sync_upstream.result == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            image_suffix: ""
+          - dockerfile: Dockerfile.sandbox
+            image_suffix: -sandbox
+          - dockerfile: Dockerfile.sandbox-browser
+            image_suffix: -sandbox-browser
+    steps:
+      - name: Checkout source at synced commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync_upstream.outputs.synced_sha }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Dockerfile exists
+        id: verify
+        run: |
+          if [ -f "${{ matrix.dockerfile }}" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Skip ${{ matrix.dockerfile }} because file is missing."
+          fi
+
+      - name: Docker metadata
+        if: steps.verify.outputs.exists == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/openclaw${{ matrix.image_suffix }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+
+      - name: Build and push
+        if: steps.verify.outputs.exists == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
