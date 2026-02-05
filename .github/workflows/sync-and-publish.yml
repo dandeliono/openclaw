@@ -1,0 +1,81 @@
+name: Build and publish Docker images from upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-from-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish_images:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            image_suffix: ""
+          - dockerfile: Dockerfile.sandbox
+            image_suffix: -sandbox
+          - dockerfile: Dockerfile.sandbox-browser
+            image_suffix: -sandbox-browser
+
+    steps:
+      - name: Clone upstream repository
+        env:
+          UPSTREAM_REPO: https://github.com/openclaw/openclaw.git
+        run: |
+          set -eux
+          git clone --depth 1 "$UPSTREAM_REPO" upstream-src
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Dockerfile exists in upstream
+        id: verify
+        run: |
+          if [ -f "upstream-src/${{ matrix.dockerfile }}" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Skip ${{ matrix.dockerfile }} because file is missing in upstream repository."
+          fi
+
+      - name: Docker metadata
+        if: steps.verify.outputs.exists == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/openclaw${{ matrix.image_suffix }}
+          tags: |
+            type=raw,value=latest
+            type=schedule
+            type=sha
+
+      - name: Build and push
+        if: steps.verify.outputs.exists == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream-src
+          file: upstream-src/${{ matrix.dockerfile }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
